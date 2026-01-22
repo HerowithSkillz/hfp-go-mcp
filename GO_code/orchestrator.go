@@ -1,0 +1,218 @@
+package main
+
+import (
+	"bytes"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	_ "github.com/lib/pq"           // Postgres Driver
+	_ "github.com/mattn/go-sqlite3" // SQLite Driver
+)
+
+// --- CONFIGURATION ---
+var (
+	// Local = "sqlite3", Server = "postgres"
+	DBDriver = getEnv("DB_DRIVER", "sqlite3")
+
+	// Network: Local = "tcp" (:8080), Server = "unix" (/tmp/sock)
+	NetworkType = getEnv("NET_TYPE", "tcp")
+	NetworkAddr = getEnv("NET_ADDR", ":8080")
+
+	// Target: Where to forward traffic?
+	TargetURL = getEnv("TARGET_URL", "http://127.0.0.1:8085")
+
+	// Postgres Settings (Only used if DBDriver == "postgres")
+	DB_HOST     = getEnv("DB_HOST", "localhost")
+	DB_PORT     = getEnv("DB_PORT", "5432")
+	DB_USER     = getEnv("DB_USER", "postgres")
+	DB_PASSWORD = getEnv("DB_PASSWORD", "password")
+	DB_NAME     = getEnv("DB_NAME", "postgres")
+)
+
+var db *sql.DB
+
+type ChatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+func main() {
+	log.Printf("⚙️  Mode: %s | DB: %s", NetworkType, DBDriver)
+	
+	// 1. CONNECT TO DB
+	initDB()
+
+	// 2. START LISTENER
+	var listener net.Listener
+	var err error
+
+	if NetworkType == "unix" {
+		if _, err := os.Stat(NetworkAddr); err == nil {
+			os.Remove(NetworkAddr)
+		}
+		listener, err = net.Listen("unix", NetworkAddr)
+		os.Chmod(NetworkAddr, 0777)
+	} else {
+		listener, err = net.Listen("tcp", NetworkAddr)
+	}
+
+	if err != nil {
+		log.Fatalf("❌ Failed to bind: %v", err)
+	}
+
+	log.Printf("🟢 Go Brain running on %s", NetworkAddr)
+	http.Serve(listener, http.HandlerFunc(handleProxy))
+}
+
+func handleProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" || !strings.Contains(r.URL.Path, "/chat/completions") {
+		http.Error(w, "Not Found", 404)
+		return
+	}
+
+	// Read & Parse Body
+	bodyBytes, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	
+	var reqPayload map[string]interface{}
+	json.Unmarshal(bodyBytes, &reqPayload)
+	userID := r.Header.Get("X-Request-ID")
+	if userID == "" { userID = "local-dev" }
+
+	// Save User Message
+	messages_raw, _ := json.Marshal(reqPayload["messages"])
+	var messages []ChatMessage
+	json.Unmarshal(messages_raw, &messages)
+	
+	if len(messages) > 0 {
+		lastMsg := messages[len(messages)-1]
+		if lastMsg.Role == "user" {
+			go saveToDB(userID, "user", lastMsg.Content)
+		}
+	}
+
+	// Inject History
+	history := getHistory(userID)
+	if len(history) > 0 {
+		messages = append(history, messages...)
+		reqPayload["messages"] = messages
+	}
+
+	// Forward Request
+	newBody, _ := json.Marshal(reqPayload)
+	proxyReq, _ := http.NewRequest("POST", TargetURL+r.URL.Path, bytes.NewBuffer(newBody))
+	proxyReq.Header = r.Header
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		log.Printf("❌ Upstream Error: %v", err)
+		http.Error(w, "AI Node Offline", 502)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Return Response
+	copyHeader(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	
+	var responseBuffer bytes.Buffer
+	multiWriter := io.MultiWriter(w, &responseBuffer)
+	io.Copy(multiWriter, resp.Body)
+
+	// Save AI Response
+	go saveToDB(userID, "assistant", responseBuffer.String())
+}
+
+// --- DATABASE HELPERS ---
+func initDB() {
+	var err error
+	if DBDriver == "sqlite3" {
+		// LOCAL MODE: Use a file
+		db, err = sql.Open("sqlite3", "./local_chat.db")
+		if err == nil {
+			log.Println("📂 Using SQLite (Local File)")
+			query := `CREATE TABLE IF NOT EXISTS chat_history (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				session_id TEXT, role TEXT, content TEXT,
+				created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			);`
+			db.Exec(query)
+		}
+	} else {
+		// SERVER MODE: Use Postgres
+		psqlInfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+			DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME)
+		db, err = sql.Open("postgres", psqlInfo)
+		if err == nil {
+			log.Println("🐘 Using PostgreSQL (Server)")
+			query := `CREATE TABLE IF NOT EXISTS chat_history (
+				id SERIAL PRIMARY KEY,
+				session_id TEXT, role TEXT, content TEXT,
+				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			);`
+			db.Exec(query)
+		}
+	}
+	
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func saveToDB(sid, role, content string) {
+	var query string
+	if DBDriver == "sqlite3" {
+		query = `INSERT INTO chat_history (session_id, role, content) VALUES (?, ?, ?)`
+	} else {
+		query = `INSERT INTO chat_history (session_id, role, content) VALUES ($1, $2, $3)`
+	}
+	db.Exec(query, sid, role, content)
+}
+
+func getHistory(sid string) []ChatMessage {
+	var query string
+	if DBDriver == "sqlite3" {
+		query = "SELECT role, content FROM chat_history WHERE session_id = ? ORDER BY id DESC LIMIT 10"
+	} else {
+		query = "SELECT role, content FROM chat_history WHERE session_id = $1 ORDER BY id DESC LIMIT 10"
+	}
+	
+	rows, _ := db.Query(query, sid)
+	if rows != nil {
+		defer rows.Close()
+	} else {
+		return []ChatMessage{}
+	}
+
+	var history []ChatMessage
+	for rows.Next() {
+		var msg ChatMessage
+		rows.Scan(&msg.Role, &msg.Content)
+		history = append([]ChatMessage{msg}, history...)
+	}
+	// Reverse
+	for i, j := 0, len(history)-1; i < j; i, j = i+1, j-1 {
+		history[i], history[j] = history[j], history[i]
+	}
+	return history
+}
+
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists { return value }
+	return fallback
+}
+
+func copyHeader(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv { dst.Add(k, v) }
+	}
+}

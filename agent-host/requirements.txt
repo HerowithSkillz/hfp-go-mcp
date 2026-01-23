@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+mcp
+fastmcp
+httpx
+pytesseract
+pdf2image
+Pillow
+python-multipart

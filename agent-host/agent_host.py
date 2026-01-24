@@ -1,7 +1,7 @@
 import os
 import json
 import httpx
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, AsyncExitStack
 from fastapi import FastAPI, Request
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -9,86 +9,82 @@ from mcp.client.stdio import stdio_client
 # =============================================================================
 # ⚙️ CONFIGURATION
 # =============================================================================
-# Path to your tools server
-# We use the absolute path to 'uv' to ensure systemd finds it
 MCP_SERVER_COMMAND = "/root/.local/bin/uv"
 MCP_SERVER_ARGS = ["run", "tools_server.py"]
-
-# 🌉 THE BRIDGE URLS
-# We point to the local Caddy /upstream endpoint.
-# Caddy will handle the "Least Connection" logic to find a free laptop.
 UPSTREAM_BASE_URL = "http://localhost/upstream"
 
-# Global variables to hold the tool connection open
+# Global Session
 mcp_session = None
-mcp_process = None
+exit_stack = None  # Holds the connection context
 
 # =============================================================================
-# 🔌 LIFESPAN MANAGER (Startup/Shutdown)
+# 🔌 LIFESPAN MANAGER (Robust Version)
 # =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Connects to the MCP Tools when the server starts.
-    """
-    global mcp_session, mcp_process
+    global mcp_session, exit_stack
     print("\n🔌 Agent Host: Initializing Connection to MCP Tools...")
 
+    exit_stack = AsyncExitStack()
+    
     try:
-        # Define how to start the tool
+        # 1. Start the Tool Server (Subprocess)
         server_params = StdioServerParameters(command=MCP_SERVER_COMMAND, args=MCP_SERVER_ARGS)
         
-        # Start the subprocess and session
-        stack = await stdio_client(server_params).__aenter__()
-        read, write = stack
-        mcp_process = stack
+        # Use ExitStack to properly enter the context manager
+        # This handles the __aenter__ and __aexit__ logic correctly
+        read, write = await exit_stack.enter_async_context(stdio_client(server_params))
         
-        mcp_session = ClientSession(read, write)
-        await mcp_session.__aenter__()
+        # 2. Start the Session
+        mcp_session = await exit_stack.enter_async_context(ClientSession(read, write))
         
-        # Perform Handshake
+        # 3. Handshake
         init_result = await mcp_session.initialize()
         print(f"✅ Agent Host: Connected to {init_result.serverInfo.name} (v{init_result.serverInfo.version})")
         print("🚀 Server is ready to accept chats!")
         
-        yield # The application runs here...
+        yield # App runs here...
         
     except Exception as e:
-        print(f"⚠️ Lifespan Error: {e}")
-        yield # Allow app to run even if tools fail (for debugging)
+        print(f"❌ Critical Lifespan Error: {e}")
+        yield # Allow app to run in "Text Only" mode if tools fail
         
     finally:
-        # Cleanup on shutdown
         print("\n🛑 Agent Host: Shutting down tools...")
-        if mcp_session:
-            await mcp_session.__aexit__(None, None, None)
-        if mcp_process:
-            await mcp_process.__aexit__(None, None, None)
+        if exit_stack:
+            await exit_stack.aclose()
 
-# Initialize the App
 app = FastAPI(lifespan=lifespan)
 
 # =============================================================================
-# 📋 MODELS ENDPOINT (New Fix)
+# 📋 MODELS ENDPOINT (Debug Enabled)
 # =============================================================================
 @app.get("/v1/models")
 async def list_models():
     """
-    Proxy the models list from the upstream cluster.
-    If the cluster is busy, return a default list so the UI doesn't crash.
+    Proxy the models list. If it fails, print the REAL error.
     """
     async with httpx.AsyncClient() as client:
         try:
-            # Ask the cluster what models it has
             resp = await client.get(f"{UPSTREAM_BASE_URL}/models", timeout=5.0)
+            
+            # Check if Caddy returned an error (4xx or 5xx)
+            if resp.status_code != 200:
+                print(f"⚠️ Upstream Error {resp.status_code}: {resp.text}")
+                raise Exception(f"Upstream returned {resp.status_code}")
+
             return resp.json()
+
         except Exception as e:
-            print(f"⚠️ Failed to fetch models from cluster: {e}")
-            # Fallback List (Keeps UI happy)
+            # Only print the short error to keep logs clean
+            # If it's a JSON parse error, it means we got HTML/Text back
+            print(f"⚠️ Cluster Error: {str(e)[:100]}")
+            
+            # Return Fallback so UI loads
             return {
                 "object": "list",
                 "data": [{
-                    "id": "Distributed-Agent-Cluster",
+                    "id": "Distributed-Cluster-Offline",
                     "object": "model",
                     "created": 1677610602,
                     "owned_by": "nominee"
@@ -96,19 +92,13 @@ async def list_models():
             }
 
 # =============================================================================
-# 🧠 THE AGENTIC LOOP (Chat Endpoint)
+# 🧠 CHAT ENDPOINT
 # =============================================================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """
-    The Brain of the Agent.
-    It sits between the User and the Cluster (LLMs).
-    """
-    # 1. Parse User Request
     data = await request.json()
     
-    # 2. Discover Tools (Act 3)
-    # Check if tools are active
+    # 1. Discover Tools
     available_tools = []
     if mcp_session:
         try:
@@ -116,76 +106,67 @@ async def chat_completions(request: Request):
             available_tools = [{
                 "type": "function",
                 "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.inputSchema
+                    "name": t.name, 
+                    "description": t.description, 
+                    "parameters": t.inputSchema
                 }
-            } for tool in tools_list.tools]
-        except Exception as e:
-            print(f"⚠️ Tool Discovery Failed: {e}")
+            } for t in tools_list.tools]
+        except Exception:
+            pass # Ignore tool errors during chat
 
-    # 3. Call the LLM (The Thought)
+    # 2. Forward to Cluster
     print(f"🧠 Forwarding to Cluster...")
-    
     async with httpx.AsyncClient() as client:
         payload = data.copy()
         if available_tools:
             payload["tools"] = available_tools
             payload["tool_choice"] = "auto"
 
-        # Long timeout allows the laptop to process the prompt
         try:
+            # Call Caddy -> Laptop
             llm_response = await client.post(
                 f"{UPSTREAM_BASE_URL}/chat/completions",
                 json=payload,
                 timeout=120.0 
             )
-            llm_data = llm_response.json()
-        except Exception as e:
-            return {"error": f"Cluster Unreachable: {str(e)}"}
+            
+            # Catch Caddy Errors (502/503)
+            if llm_response.status_code != 200:
+                print(f"❌ Upstream Failed: {llm_response.status_code} - {llm_response.text}")
+                return {"error": f"Cluster Error: {llm_response.status_code}"}
 
-    # 4. Check for Tool Calls (The Decision)
+            llm_data = llm_response.json()
+
+        except Exception as e:
+            return {"error": f"Connection Error: {str(e)}"}
+
+    # 3. Handle Tool Calls
     if "choices" in llm_data and llm_data["choices"]:
         choice = llm_data["choices"][0]
-        message = choice.get("message", {})
+        msg = choice.get("message", {})
         
-        if message.get("tool_calls"):
-            tool_call = message["tool_calls"][0]
-            fn_name = tool_call["function"]["name"]
-            fn_args_str = tool_call["function"]["arguments"]
+        if msg.get("tool_calls"):
+            t_call = msg["tool_calls"][0]
+            fn_name = t_call["function"]["name"]
+            fn_args = t_call["function"]["arguments"]
             
-            print(f"🛠️  AI decided to use tool: {fn_name}")
-            
-            # Act 4: Execution
+            print(f"🛠️  Tool Call: {fn_name}")
             try:
-                args_dict = json.loads(fn_args_str)
-                if mcp_session:
-                    result = await mcp_session.call_tool(fn_name, arguments=args_dict)
-                    tool_output_text = result.content[0].text if result.content else ""
-                else:
-                    tool_output_text = "Error: MCP Session not active."
-
-                print(f"✅ Tool Result: {tool_output_text[:50]}...")
+                args = json.loads(fn_args)
+                result = await mcp_session.call_tool(fn_name, arguments=args)
+                output = result.content[0].text if result.content else ""
                 
                 return {
-                    "id": llm_data.get("id"),
-                    "object": "chat.completion",
-                    "created": llm_data.get("created"),
                     "choices": [{
-                        "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": f"🤖 **Tool Output:**\n\n{tool_output_text}"
-                        },
-                        "finish_reason": "stop"
+                            "content": f"🤖 **Tool Output:**\n\n{output}"
+                        }
                     }]
                 }
-
             except Exception as e:
-                print(f"❌ Tool Execution Error: {e}")
-                return llm_data
+                return {"choices": [{"message": {"role": "assistant", "content": f"Tool Error: {e}"}}]}
 
-    # If no tool was called, just return the AI's normal text response
     return llm_data
 
 if __name__ == "__main__":

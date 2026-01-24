@@ -1,8 +1,10 @@
 import os
 import json
 import httpx
+import asyncio
 from contextlib import asynccontextmanager, AsyncExitStack
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse  # <--- CHANGED: Added this import
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -79,6 +81,58 @@ async def list_models():
             }
 
 # =============================================================================
+# 🌊 FAKE STREAMER (The Fix for UI Protocol)
+# =============================================================================
+async def fake_data_streamer(full_response_json):
+    """
+    Takes a static JSON response and yields it line-by-line 
+    to mimic the Server-Sent Events (SSE) stream the UI expects.
+    """
+    # Extract the ID and Content
+    req_id = full_response_json.get("id", "chatcmpl-mock")
+    
+    content = ""
+    # Try to extract content from normal response or tool output structure
+    if "choices" in full_response_json and full_response_json["choices"]:
+        msg = full_response_json["choices"][0].get("message", {})
+        content = msg.get("content", "")
+    
+    # If content is None (e.g. pure tool call), default to empty string
+    if content is None:
+        content = ""
+
+    # split by words to simulate typing effect
+    chunks = content.split(" ")
+    
+    for i, word in enumerate(chunks):
+        # Reconstruct the space we split by (except for the last word)
+        text_chunk = word + (" " if i < len(chunks) - 1 else "")
+        
+        # Construct the SSE Data Chunk
+        chunk_data = {
+            "id": req_id,
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "agent-host-proxy",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": text_chunk},
+                    "finish_reason": None
+                }
+            ]
+        }
+        
+        # Yield formatted SSE line
+        yield f"data: {json.dumps(chunk_data)}\n\n"
+        
+        # Small sleep to simulate typing (optional, makes it look real)
+        await asyncio.sleep(0.02)
+
+    # Send the [DONE] signal
+    yield "data: [DONE]\n\n"
+
+# =============================================================================
 # 🧠 CHAT ENDPOINT
 # =============================================================================
 @app.post("/v1/chat/completions")
@@ -106,7 +160,7 @@ async def chat_completions(request: Request):
     async with httpx.AsyncClient() as client:
         payload = data.copy()
         
-        # ⚠️ FORCE NON-STREAMING (The Fix)
+        # ⚠️ FORCE NON-STREAMING (For Server Logic)
         payload["stream"] = False
         
         if available_tools:
@@ -122,17 +176,16 @@ async def chat_completions(request: Request):
             )
             
             if llm_response.status_code != 200:
-                print(f"❌ Upstream Failed: {llm_response.status_code} - {llm_response.text}")
                 return {"error": f"Cluster Error: {llm_response.status_code}"}
 
-            llm_data = llm_response.json()
+            final_response = llm_response.json()
 
         except Exception as e:
             return {"error": f"Connection Error: {str(e)}"}
 
     # 3. Handle Tool Calls
-    if "choices" in llm_data and llm_data["choices"]:
-        choice = llm_data["choices"][0]
+    if "choices" in final_response and final_response["choices"]:
+        choice = final_response["choices"][0]
         msg = choice.get("message", {})
         
         if msg.get("tool_calls"):
@@ -146,7 +199,9 @@ async def chat_completions(request: Request):
                 result = await mcp_session.call_tool(fn_name, arguments=args)
                 output = result.content[0].text if result.content else ""
                 
-                return {
+                # Update response to show tool output
+                final_response = {
+                    "id": final_response.get("id"),
                     "choices": [{
                         "message": {
                             "role": "assistant",
@@ -155,9 +210,11 @@ async def chat_completions(request: Request):
                     }]
                 }
             except Exception as e:
-                return {"choices": [{"message": {"role": "assistant", "content": f"Tool Error: {e}"}}]}
+                final_response = {"choices": [{"message": {"role": "assistant", "content": f"Tool Error: {e}"}}]}
 
-    return llm_data
+    # 4. Return FAKE STREAM (For UI Logic)
+    # We wrap the result in a generator that mimics the streaming protocol
+    return StreamingResponse(fake_data_streamer(final_response), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn

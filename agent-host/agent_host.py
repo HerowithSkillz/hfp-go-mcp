@@ -11,14 +11,15 @@ from mcp.client.stdio import stdio_client
 # =============================================================================
 MCP_SERVER_COMMAND = "/root/.local/bin/uv"
 MCP_SERVER_ARGS = ["run", "tools_server.py"]
-UPSTREAM_BASE_URL = "http://localhost/upstream"
+# Use the HTTP bridge to avoid Caddy 308 Redirects
+UPSTREAM_BASE_URL = "http://127.0.0.1:8085"
 
 # Global Session
 mcp_session = None
-exit_stack = None  # Holds the connection context
+exit_stack = None
 
 # =============================================================================
-# 🔌 LIFESPAN MANAGER (Robust Version)
+# 🔌 LIFESPAN MANAGER
 # =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -28,14 +29,11 @@ async def lifespan(app: FastAPI):
     exit_stack = AsyncExitStack()
     
     try:
-        # 1. Start the Tool Server (Subprocess)
+        # 1. Start the Tool Server
         server_params = StdioServerParameters(command=MCP_SERVER_COMMAND, args=MCP_SERVER_ARGS)
         
-        # Use ExitStack to properly enter the context manager
-        # This handles the __aenter__ and __aexit__ logic correctly
+        # 2. Enter Contexts
         read, write = await exit_stack.enter_async_context(stdio_client(server_params))
-        
-        # 2. Start the Session
         mcp_session = await exit_stack.enter_async_context(ClientSession(read, write))
         
         # 3. Handshake
@@ -43,11 +41,11 @@ async def lifespan(app: FastAPI):
         print(f"✅ Agent Host: Connected to {init_result.serverInfo.name} (v{init_result.serverInfo.version})")
         print("🚀 Server is ready to accept chats!")
         
-        yield # App runs here...
+        yield 
         
     except Exception as e:
         print(f"❌ Critical Lifespan Error: {e}")
-        yield # Allow app to run in "Text Only" mode if tools fail
+        yield
         
     finally:
         print("\n🛑 Agent Host: Shutting down tools...")
@@ -57,30 +55,19 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # =============================================================================
-# 📋 MODELS ENDPOINT (Debug Enabled)
+# 📋 MODELS ENDPOINT
 # =============================================================================
 @app.get("/v1/models")
 async def list_models():
-    """
-    Proxy the models list. If it fails, print the REAL error.
-    """
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(f"{UPSTREAM_BASE_URL}/models", timeout=5.0)
-            
-            # Check if Caddy returned an error (4xx or 5xx)
             if resp.status_code != 200:
                 print(f"⚠️ Upstream Error {resp.status_code}: {resp.text}")
                 raise Exception(f"Upstream returned {resp.status_code}")
-
             return resp.json()
-
         except Exception as e:
-            # Only print the short error to keep logs clean
-            # If it's a JSON parse error, it means we got HTML/Text back
             print(f"⚠️ Cluster Error: {str(e)[:100]}")
-            
-            # Return Fallback so UI loads
             return {
                 "object": "list",
                 "data": [{
@@ -112,12 +99,16 @@ async def chat_completions(request: Request):
                 }
             } for t in tools_list.tools]
         except Exception:
-            pass # Ignore tool errors during chat
+            pass 
 
     # 2. Forward to Cluster
     print(f"🧠 Forwarding to Cluster...")
     async with httpx.AsyncClient() as client:
         payload = data.copy()
+        
+        # ⚠️ FORCE NON-STREAMING (The Fix)
+        payload["stream"] = False
+        
         if available_tools:
             payload["tools"] = available_tools
             payload["tool_choice"] = "auto"
@@ -130,7 +121,6 @@ async def chat_completions(request: Request):
                 timeout=120.0 
             )
             
-            # Catch Caddy Errors (502/503)
             if llm_response.status_code != 200:
                 print(f"❌ Upstream Failed: {llm_response.status_code} - {llm_response.text}")
                 return {"error": f"Cluster Error: {llm_response.status_code}"}

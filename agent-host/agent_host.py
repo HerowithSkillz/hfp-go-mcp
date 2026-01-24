@@ -11,7 +11,8 @@ from mcp.client.stdio import stdio_client
 # =============================================================================
 # Path to your tools server (Act 1: Transport)
 # We assume tools_server.py is in the same directory (/home/hfp_go)
-MCP_SERVER_COMMAND = "uv"
+#MCP_SERVER_COMMAND = "uv"
+MCP_SERVER_COMMAND = "/root/.local/bin/uv"  # <--- UPDATED THIS LINE
 MCP_SERVER_ARGS = ["run", "tools_server.py"]
 
 #  THE BRIDGE URL

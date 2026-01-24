@@ -2,9 +2,12 @@ import os
 import json
 import httpx
 import asyncio
+import shutil
+import uuid
+from pathlib import Path
 from contextlib import asynccontextmanager, AsyncExitStack
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse  # <--- CHANGED: Added this import
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -13,8 +16,11 @@ from mcp.client.stdio import stdio_client
 # =============================================================================
 MCP_SERVER_COMMAND = "/root/.local/bin/uv"
 MCP_SERVER_ARGS = ["run", "tools_server.py"]
-# Use the HTTP bridge to avoid Caddy 308 Redirects
 UPSTREAM_BASE_URL = "http://127.0.0.1:8085"
+
+# 📁 UPLOAD SETTINGS
+UPLOAD_DIR = Path("/home/hfp_go/uploads")
+ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 
 # Global Session
 mcp_session = None
@@ -27,6 +33,10 @@ exit_stack = None
 async def lifespan(app: FastAPI):
     global mcp_session, exit_stack
     print("\n🔌 Agent Host: Initializing Connection to MCP Tools...")
+
+    # Ensure upload directory exists
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"📂 Storage: Uploads will be saved to {UPLOAD_DIR}")
 
     exit_stack = AsyncExitStack()
     
@@ -57,6 +67,42 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # =============================================================================
+# 📤 UPLOAD ENDPOINT (New Feature)
+# =============================================================================
+@app.post("/v1/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """
+    Receives a file, validates extension, saves with secure name,
+    and returns the filename to the UI.
+    """
+    # 1. Validate Extension
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"File type not allowed. Allowed: {ALLOWED_EXTENSIONS}")
+
+    # 2. Generate Secure Filename (UUID)
+    # We ignore the user's original filename to prevent directory traversal attacks
+    secure_filename = f"{uuid.uuid4()}{file_ext}"
+    save_path = UPLOAD_DIR / secure_filename
+
+    # 3. Save to Disk
+    try:
+        with save_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        print(f"❌ Upload Failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save file to server.")
+
+    print(f"✅ File Saved: {secure_filename} ({save_path})")
+
+    # 4. Return Filename (UI will send this back in the chat request)
+    return {
+        "filename": secure_filename,
+        "original_name": file.filename,
+        "status": "uploaded"
+    }
+
+# =============================================================================
 # 📋 MODELS ENDPOINT
 # =============================================================================
 @app.get("/v1/models")
@@ -81,55 +127,27 @@ async def list_models():
             }
 
 # =============================================================================
-# 🌊 FAKE STREAMER (The Fix for UI Protocol)
+# 🌊 FAKE STREAMER
 # =============================================================================
 async def fake_data_streamer(full_response_json):
-    """
-    Takes a static JSON response and yields it line-by-line 
-    to mimic the Server-Sent Events (SSE) stream the UI expects.
-    """
-    # Extract the ID and Content
     req_id = full_response_json.get("id", "chatcmpl-mock")
-    
     content = ""
-    # Try to extract content from normal response or tool output structure
     if "choices" in full_response_json and full_response_json["choices"]:
         msg = full_response_json["choices"][0].get("message", {})
         content = msg.get("content", "")
     
-    # If content is None (e.g. pure tool call), default to empty string
-    if content is None:
-        content = ""
-
-    # split by words to simulate typing effect
+    if content is None: content = ""
     chunks = content.split(" ")
     
     for i, word in enumerate(chunks):
-        # Reconstruct the space we split by (except for the last word)
         text_chunk = word + (" " if i < len(chunks) - 1 else "")
-        
-        # Construct the SSE Data Chunk
         chunk_data = {
-            "id": req_id,
-            "object": "chat.completion.chunk",
-            "created": 1234567890,
+            "id": req_id, "object": "chat.completion.chunk", "created": 1234567890,
             "model": "agent-host-proxy",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"content": text_chunk},
-                    "finish_reason": None
-                }
-            ]
+            "choices": [{"index": 0, "delta": {"content": text_chunk}, "finish_reason": None}]
         }
-        
-        # Yield formatted SSE line
         yield f"data: {json.dumps(chunk_data)}\n\n"
-        
-        # Small sleep to simulate typing (optional, makes it look real)
         await asyncio.sleep(0.02)
-
-    # Send the [DONE] signal
     yield "data: [DONE]\n\n"
 
 # =============================================================================
@@ -139,6 +157,32 @@ async def fake_data_streamer(full_response_json):
 async def chat_completions(request: Request):
     data = await request.json()
     
+    # ---------------------------------------------------------
+    # 🔍 FILE INJECTION LOGIC (The Secure Approach)
+    # ---------------------------------------------------------
+    # If the UI sent a "file_attachment" field (the filename),
+    # we resolve it to the full secure path and inject the instruction.
+    if "file_attachment" in data and data["file_attachment"]:
+        filename = data["file_attachment"]
+        # Securely construct the full path
+        full_path = UPLOAD_DIR / filename
+        
+        # Verify it exists
+        if full_path.exists():
+            print(f"📎 Attaching File: {full_path}")
+            
+            # Find the last user message and append the system instruction
+            messages = data.get("messages", [])
+            if messages:
+                last_msg = messages[-1]
+                if last_msg.get("role") == "user":
+                    original_content = last_msg.get("content", "")
+                    # Inject the path
+                    new_content = f"{original_content}\n\n[System: The user has attached a file at path: {str(full_path)}]"
+                    last_msg["content"] = new_content
+        else:
+            print(f"⚠️ Warning: User referenced file {filename}, but it does not exist.")
+
     # 1. Discover Tools
     available_tools = []
     if mcp_session:
@@ -159,8 +203,6 @@ async def chat_completions(request: Request):
     print(f"🧠 Forwarding to Cluster...")
     async with httpx.AsyncClient() as client:
         payload = data.copy()
-        
-        # ⚠️ FORCE NON-STREAMING (For Server Logic)
         payload["stream"] = False
         
         if available_tools:
@@ -168,7 +210,6 @@ async def chat_completions(request: Request):
             payload["tool_choice"] = "auto"
 
         try:
-            # Call Caddy -> Laptop
             llm_response = await client.post(
                 f"{UPSTREAM_BASE_URL}/chat/completions",
                 json=payload,
@@ -199,7 +240,6 @@ async def chat_completions(request: Request):
                 result = await mcp_session.call_tool(fn_name, arguments=args)
                 output = result.content[0].text if result.content else ""
                 
-                # Update response to show tool output
                 final_response = {
                     "id": final_response.get("id"),
                     "choices": [{
@@ -212,8 +252,6 @@ async def chat_completions(request: Request):
             except Exception as e:
                 final_response = {"choices": [{"message": {"role": "assistant", "content": f"Tool Error: {e}"}}]}
 
-    # 4. Return FAKE STREAM (For UI Logic)
-    # We wrap the result in a generator that mimics the streaming protocol
     return StreamingResponse(fake_data_streamer(final_response), media_type="text/event-stream")
 
 if __name__ == "__main__":

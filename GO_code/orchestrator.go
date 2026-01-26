@@ -24,12 +24,13 @@ var (
 
 	// Network: Local = "tcp" (:8080), Server = "unix" (/tmp/sock)
 	NetworkType = getEnv("NET_TYPE", "tcp")
-	NetworkAddr = getEnv("NET_ADDR", ":8080")
+	NetworkAddr = getEnv("NET_ADDR", ":8095")
 
 	// Target: Where to forward traffic?
-	TargetURL = getEnv("TARGET_URL", "http://127.0.0.1:8085")
+	// CHANGED: Uses AI_NODES to match your terminal command
+	TargetURL = getEnv("AI_NODES", "http://127.0.0.1:8085")
 
-	// Postgres Settings (Only used if DBDriver == "postgres")
+	// Postgres Settings
 	DB_HOST     = getEnv("DB_HOST", "localhost")
 	DB_PORT     = getEnv("DB_PORT", "5432")
 	DB_USER     = getEnv("DB_USER", "postgres")
@@ -46,7 +47,8 @@ type ChatMessage struct {
 
 func main() {
 	log.Printf("⚙️  Mode: %s | DB: %s", NetworkType, DBDriver)
-	
+	log.Printf("🎯 Forwarding to: %s", TargetURL)
+
 	// 1. CONNECT TO DB
 	initDB()
 
@@ -71,98 +73,104 @@ func main() {
 	log.Printf("🟢 Go Brain running on %s", NetworkAddr)
 	http.Serve(listener, http.HandlerFunc(handleProxy))
 }
-
 func handleProxy(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" || !strings.Contains(r.URL.Path, "/chat/completions") {
-		http.Error(w, "Not Found", 404)
-		return
-	}
+	// 1. LOG EVERYTHING (Don't block anything)
+	log.Printf("📩 Request: %s [%s]", r.URL.Path, r.Method)
 
-	// Read & Parse Body
+	// 2. READ BODY (Need it for logging OR forwarding)
 	bodyBytes, _ := io.ReadAll(r.Body)
 	r.Body.Close()
-	
-	var reqPayload map[string]interface{}
-	json.Unmarshal(bodyBytes, &reqPayload)
-	userID := r.Header.Get("X-Request-ID")
-	if userID == "" { userID = "local-dev" }
 
-	// Save User Message
-	messages_raw, _ := json.Marshal(reqPayload["messages"])
-	var messages []ChatMessage
-	json.Unmarshal(messages_raw, &messages)
-	
-	if len(messages) > 0 {
-		lastMsg := messages[len(messages)-1]
-		if lastMsg.Role == "user" {
-			go saveToDB(userID, "user", lastMsg.Content)
+	// 3. CHECK: Is this a Chat? (Only log chats to DB)
+	isChat := (r.Method == "POST" && strings.Contains(r.URL.Path, "/chat/completions"))
+	userID := r.Header.Get("X-Request-ID")
+	if userID == "" {
+		userID = "unknown"
+	}
+
+	// 4. IF CHAT: SAVE PROMPT
+	if isChat {
+		var reqPayload map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &reqPayload); err == nil {
+			messages_raw, _ := json.Marshal(reqPayload["messages"])
+			var messages []ChatMessage
+			json.Unmarshal(messages_raw, &messages)
+
+			if len(messages) > 0 {
+				lastMsg := messages[len(messages)-1]
+				if lastMsg.Role == "user" {
+					log.Printf("📝 Logging User Prompt...")
+					go saveToDB(userID, "user", lastMsg.Content)
+				}
+			}
 		}
 	}
 
-	// Inject History
-	history := getHistory(userID)
-	if len(history) > 0 {
-		messages = append(history, messages...)
-		reqPayload["messages"] = messages
-	}
-
-	// Forward Request
-	newBody, _ := json.Marshal(reqPayload)
-	proxyReq, _ := http.NewRequest("POST", TargetURL+r.URL.Path, bytes.NewBuffer(newBody))
+	// 5. FORWARD EVERYTHING (Models, Health, Chats - all of it!)
+	// Use r.Method so GET requests (like /models) work too
+	proxyReq, _ := http.NewRequest(r.Method, TargetURL+r.URL.Path, bytes.NewBuffer(bodyBytes))
 	proxyReq.Header = r.Header
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		log.Printf("❌ Upstream Error: %v", err)
-		http.Error(w, "AI Node Offline", 502)
+		http.Error(w, "AI Cluster Offline", 502)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Return Response
+	// 6. RETURN RESPONSE
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	
-	var responseBuffer bytes.Buffer
-	multiWriter := io.MultiWriter(w, &responseBuffer)
-	io.Copy(multiWriter, resp.Body)
 
-	// Save AI Response
-	go saveToDB(userID, "assistant", responseBuffer.String())
+	// 7. IF CHAT: CAPTURE RESPONSE (Otherwise just stream it)
+	var responseBuffer bytes.Buffer
+	var outputWriter io.Writer
+
+	if isChat {
+		outputWriter = io.MultiWriter(w, &responseBuffer)
+	} else {
+		outputWriter = w
+	}
+
+	io.Copy(outputWriter, resp.Body)
+
+	// 8. SAVE RESPONSE TO DB (Only if it was a chat)
+	if isChat {
+		go saveToDB(userID, "assistant", responseBuffer.String())
+	}
 }
 
 // --- DATABASE HELPERS ---
 func initDB() {
 	var err error
 	if DBDriver == "sqlite3" {
-		// LOCAL MODE: Use a file
 		db, err = sql.Open("sqlite3", "./local_chat.db")
 		if err == nil {
 			log.Println("📂 Using SQLite (Local File)")
 			query := `CREATE TABLE IF NOT EXISTS chat_history (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				session_id TEXT, role TEXT, content TEXT,
-				created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-			);`
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT, role TEXT, content TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );`
 			db.Exec(query)
 		}
 	} else {
-		// SERVER MODE: Use Postgres
 		psqlInfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 			DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME)
 		db, err = sql.Open("postgres", psqlInfo)
 		if err == nil {
 			log.Println("🐘 Using PostgreSQL (Server)")
 			query := `CREATE TABLE IF NOT EXISTS chat_history (
-				id SERIAL PRIMARY KEY,
-				session_id TEXT, role TEXT, content TEXT,
-				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-			);`
+                id SERIAL PRIMARY KEY,
+                session_id TEXT, role TEXT, content TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );`
 			db.Exec(query)
 		}
 	}
-	
+
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -185,7 +193,7 @@ func getHistory(sid string) []ChatMessage {
 	} else {
 		query = "SELECT role, content FROM chat_history WHERE session_id = $1 ORDER BY id DESC LIMIT 10"
 	}
-	
+
 	rows, _ := db.Query(query, sid)
 	if rows != nil {
 		defer rows.Close()
@@ -207,12 +215,16 @@ func getHistory(sid string) []ChatMessage {
 }
 
 func getEnv(key, fallback string) string {
-	if value, exists := os.LookupEnv(key); exists { return value }
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
 	return fallback
 }
 
 func copyHeader(dst, src http.Header) {
 	for k, vv := range src {
-		for _, v := range vv { dst.Add(k, v) }
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
 	}
 }

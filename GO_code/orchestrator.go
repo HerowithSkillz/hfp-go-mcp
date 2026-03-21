@@ -140,6 +140,20 @@ func handleCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// FlushWriter wraps an http.ResponseWriter and forces a network flush on every write
+type FlushWriter struct {
+	w http.ResponseWriter
+}
+
+func (fw *FlushWriter) Write(p []byte) (n int, err error) {
+	n, err = fw.w.Write(p)
+	// Instantly push the data to the frontend
+	if f, ok := fw.w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return
+}
+
 // =============================================================================
 // ORIGINAL PROXY HANDLER (100% UNCHANGED)
 // =============================================================================
@@ -171,7 +185,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				if lastMsg.Role == "user" {
 					log.Printf("📝 Logging User Prompt...")
 					go saveToDB(userID, "user", lastMsg.Content)
-				}
+				}	
 			}
 		}
 	}
@@ -194,16 +208,19 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	// 7. IF CHAT: CAPTURE RESPONSE (Otherwise just stream it)
+	// 7. IF CHAT: CAPTURE RESPONSE AND FORCE FLUSH
 	var responseBuffer bytes.Buffer
 	var outputWriter io.Writer
 
 	if isChat {
-		outputWriter = io.MultiWriter(w, &responseBuffer)
+		// Wrap 'w' in our custom FlushWriter so SSE tokens stream instantly
+		flushableWriter := &FlushWriter{w: w}
+		outputWriter = io.MultiWriter(flushableWriter, &responseBuffer)
 	} else {
 		outputWriter = w
 	}
 
+	// This will now copy data to the DB buffer AND stream it live to the UI
 	io.Copy(outputWriter, resp.Body)
 
 	// 8. SAVE RESPONSE TO DB (Only if it was a chat)
@@ -211,6 +228,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		go saveToDB(userID, "assistant", responseBuffer.String())
 	}
 }
+
 
 // =============================================================================
 // AUTH HANDLERS

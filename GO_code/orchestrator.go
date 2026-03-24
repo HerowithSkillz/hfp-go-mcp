@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"database/sql"
@@ -191,9 +192,14 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 5. FORWARD EVERYTHING (Models, Health, Chats - all of it!)
-	// Use r.Method so GET requests (like /models) work too
 	proxyReq, _ := http.NewRequest(r.Method, TargetURL+r.URL.Path, bytes.NewBuffer(bodyBytes))
 	proxyReq.Header = r.Header
+
+	// 🔥 FIX 1: Kill Gzip Compression! Compression requires buffering and destroys streams.
+	if isChat {
+		proxyReq.Header.Del("Accept-Encoding")
+		proxyReq.Header.Set("Accept", "text/event-stream")
+	}
 
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(proxyReq)
@@ -204,31 +210,51 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// 6. RETURN RESPONSE
+	// 6. RETURN RESPONSE HEADERS
 	copyHeader(w.Header(), resp.Header)
+
+	// 🔥 FIX 2: Force explicit SSE headers so Caddy and Next.js do not buffer
+	if isChat {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no") // Tells Nginx/Caddy to bypass buffers
+	}
 	w.WriteHeader(resp.StatusCode)
 
-	// 7. IF CHAT: CAPTURE RESPONSE AND FORCE FLUSH
+	// 7. 🔥 FIX 3: Read Line-by-Line (Bypasses the 32KB io.Copy buffer entirely)
 	var responseBuffer bytes.Buffer
-	var outputWriter io.Writer
 
 	if isChat {
-		// Wrap 'w' in our custom FlushWriter so SSE tokens stream instantly
-		flushableWriter := &FlushWriter{w: w}
-		outputWriter = io.MultiWriter(flushableWriter, &responseBuffer)
-	} else {
-		outputWriter = w
-	}
-
-	// This will now copy data to the DB buffer AND stream it live to the UI
-	io.Copy(outputWriter, resp.Body)
-
-	// 8. SAVE RESPONSE TO DB (Only if it was a chat)
-	if isChat {
+		// Read the stream exactly as it arrives, line by line
+		reader := bufio.NewReader(resp.Body)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				// Write to the UI
+				w.Write(line)
+				// Save for the Database
+				responseBuffer.Write(line) 
+				
+				// INSTANT FLUSH
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush() 
+				}
+			}
+			// Break if the stream is finished or disconnected
+			if err != nil {
+				break 
+			}
+		}
+		
+		// 8. SAVE RESPONSE TO DB
 		go saveToDB(userID, "assistant", responseBuffer.String())
+		
+	} else {
+		// Normal proxy for non-streaming routes (like /models)
+		io.Copy(w, resp.Body)
 	}
 }
-
 
 // =============================================================================
 // AUTH HANDLERS
